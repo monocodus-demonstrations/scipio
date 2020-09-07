@@ -1,18 +1,93 @@
 # scipio
 
-Scipio (pronounced skip-iow) is a Cooperative Thread-per-Core crate for
-Rust & Linux based on `io_uring` It is named after Publius Cornelius Scipio,
-who defeated Hannibal Barca at the Battle of Zama, ending the Second Punic War.
-I actually like Hannibal a bit more (just a bit), but Scipio ends with IO, which
-makes for a nicer name for an I/O oriented framework.
+[![CircleCI](https://circleci.com/gh/DataDog/scipio.svg?style=svg)](https://circleci.com/gh/DataDog/scipio)
+
+Scipio (pronounced skip-io or |skɪpjəʊ|) is a Cooperative Thread-per-Core crate for
+Rust & Linux based on `io_uring`. Like other rust asynchronous crates it allows
+one to write asynchronous code that takes advantage of rust `async`/`await`, but
+unlike its counterparts it doesn't use helper threads anywhere.
+
+Using Scipio is not hard if you are familiar with rust async. All you have to do is:
+
+```rust
+    let ex = LocalExecutor::new(None).unwrap();
+    ex.run(async {
+        /// your code here
+    });
+```
+
+Although this is not forced upon the user, by creating N executors and binding
+each to a specific CPU one can use this crate to implement a thread-per-core
+system where context switches essentially never happen, achieving maximum efficiency.
+
+You can easily bind an executor to a CPU by adjusting the parameter to `new` in the
+example above:
+
+```rust
+    /// This will now never leave CPU 0
+    let ex = LocalExecutor::new(Some(0)).unwrap();
+    ex.run(async {
+        /// your code here
+    });
+```
+
+Note that you can only have one executor per thread, so if you need more executors,
+you will have to create more threads (we do consider providing helper code for that soon)
+
+For a Thread-per-core-system to work well, it is paramount that some form of scheduling
+can happen within the thread. A traditional application would use many threads to divide
+the many aspects of its workload but that is a luxury that a Thread-per-Core application doesn't have.
+
+However what looks like a shortcoming, is actually an advantage: you can create many independent
+task queues inside each of your executors:
+
+```rust
+    let ex = LocalExecutor::new(Some(0)).unwrap();
+    ex.run(async {
+        let tq1 = Task::<()>::create_task_queue(2, Latency::NotImportant, "test1");
+        let tq2 = Task::<()>::create_task_queue(1, Latency::NotImportant, "test2");
+            let t1 = Task::local_into(async move {
+            // your code here
+                }, tq1);
+            let t2 = Task::local_into(async move {
+            // your code here
+                }, tq2);
+        join!(t1, t2);
+    });
+
+```
+
+This example creates two task queues: `tq1` has 2 shares, `tq2` has 1 share. This means
+that if both want to use the CPU to its maximum, `tq1` will have `1/3` of the CPU time
+`(1 / (1 + 2))` and `tq2` will have `2/3` of the CPU time. Those shares are dynamic and
+can be changed at any time.
+Notice that this scheduling method doesn't prevent either `tq1` no `tq2` from using
+100% of CPU time: the shares are only concidered when multiple queues need to run.
+
+## What does scipio mean?
+
+This crate is named after
+[Publius Cornelius Scipio](https://en.wikipedia.org/wiki/Scipio_Africanus), who
+defeated [Hannibal Barca](https://en.wikipedia.org/wiki/Hannibal) at the
+[Battle of Zama](https://en.wikipedia.org/wiki/Battle_of_Zama), ending the
+[Second Punic War](https://en.wikipedia.org/wiki/Second_Punic_War). I actually
+like Hannibal a bit more (just a bit), but Scipio ends with IO, which makes for a
+nicer name for an I/O oriented framework.
+
+## Prior work
 
 This work is heavily inspired (with some code respectfully imported) by
 the great work by Stjepan Glavina, in particular the following crates:
 
-* [async-io](https://github.com/stjepang/async-io)]
-* [async-task](https://github.com/stjepang/async-task)]
-* [async-executor](https://github.com/stjepang/async-executor)]
-* [multitask](https://github.com/stjepang/async-multitask)]
+* [async-io](https://github.com/stjepang/async-io)
+* [async-task](https://github.com/stjepang/async-task)
+* [async-executor](https://github.com/stjepang/async-executor)
+* [multitask](https://github.com/stjepang/async-multitask)
+
+Aside from Stjepan's work, this is also inspired greatly by the
+[Seastar](http://seastar.io) Framework for C++ that powers I/O intensive
+systems that are pushing the performance envelope, like
+[ScyllaDB](https://www.scylladb.com/).
 
 ## Why is this its own crate?
 
@@ -87,20 +162,33 @@ register 3 rings per CPU:
    not relying on interrupts we can be even more efficient with I/O in
    high IOPS scenarios
 
+Please note Scipio requires at least 256 KiB of locked memory for `io_uring`
+to work. You can increase the `memlock` resource limit (rlimit) as follows:
 
-## Additional inspiration
+```
+$ vi /etc/security/limits.conf
+*	hard	memlock		512
+*	soft	memlock		512
+```
 
-Aside from Stjepan's work, this is also inspired greatly by the
-[Seastar](http://seastar.io) Framework for C++ that powers I/O intensive
-systems that are pushing the performance envelope, like ScyllaDB.
+To make the new limits effective, you need to login to the machine
+again. You can verify that the limits are updated by running the
+following:
 
-However due to my immediate needs which are a lot narrower, we make
+```
+$ ulimit -l
+512
+```
+
+## Current limitations
+
+Due to our immediate needs which are a lot narrower, we make
 the following design assumptions:
 
  - NVMe. Supports for any other storage type is not even considered.
    This allow us to use io uring's poll ring for reads and writes which
-   are interrupt free. This also assumes that one is running either XFS
-   or Ext4 (an assumption that Seastar also makes)
+   are interrupt free. This also assumes that one is running either `XFS`
+   or `Ext4` (an assumption that Seastar also makes)
 
  - A corollary to the above is that the CPUs are likely to be the
    bottleneck, so this crate has a CPU scheduler but lacks an I/O
@@ -124,7 +212,7 @@ There are many. In particular:
 
 * As mentioned, an I/O Scheduler.
 
-* The networking code uses `poll + rw`. This is essentially so I could
+* The networking code uses `poll + rw`. This is essentially so we could
   get started sooner by reusing code from [async-io](https://github.com/stjepang/async-io)
   but we really should be using uring's native interface for that
 
@@ -140,7 +228,7 @@ Licensed under either of
 
 at your option.
 
-#### Contribution
+### Contribution
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
